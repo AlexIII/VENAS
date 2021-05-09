@@ -3,6 +3,7 @@
 #include <vector>
 #include <set>
 #include <algorithm>
+#include "MPIwrapper.h"
 
 using namespace std;
 
@@ -58,34 +59,14 @@ void idx2ij(size_t idx, size_t n_seq, size_t& i, size_t& j) {
 	}
 }
 
-int *dis, *dsr;
+int *dsr;
 int* g_posref;
-double* mmf;
-string* strs;
 
 inline bool cmp_posref(const int& a, const int& b) {
 	return g_posref[a] < g_posref[b];
 }
 
 size_t g_n_seq;
-
-inline bool cmp_idx(const int& a, const int& b) {
-	if (dis[a] != dis[b]) {
-		return dis[a] < dis[b];
-	} else if (mmf[a] != mmf[b]) {
-		return mmf[a] < mmf[b];
-	} else {
-		// For total numerical equivalence to python's sort.
-		size_t ia, ja, ib, jb;
-		idx2ij(a, g_n_seq, ia, ja);
-		idx2ij(b, g_n_seq, ib, jb);
-		if (ia == ib) {
-			return ja < jb;
-		} else {
-			return ia < ib;
-		}
-	}
-}
 
 int getroot(int u) {
 	int p, q;
@@ -94,28 +75,98 @@ int getroot(int u) {
 	return u;
 }
 
-extern "C" {
-void compute_hamming_matrix(
-		size_t n_seq, size_t seq_len,
-		char* seqss, double* poss_freq, int* poss_ref,
-		const char* out_file, const char* net_file) {
-	g_posref = poss_ref;
-	dis = new int[n_seq * n_seq];
-	mmf = new double[n_seq * n_seq];
-	strs = new string[n_seq * n_seq];
-	int n_tasks = (n_seq - 1) * n_seq / 2;
+// Only Root node will return true
+bool hamming_kernel(size_t n_tasks, 
+	size_t n_seq, size_t seq_len, char* seqss, double* poss_freq,
+	vector<int> &dis, vector<double> &mmf, vector<string> &strs
+) {
+	auto mpi = MPIwrapper();
+
+	const size_t nodePartSz = n_tasks / mpi.gridSize;
+	const size_t begin = nodePartSz * mpi.myId;
+	const size_t end = mpi.myId == mpi.gridSize-1? n_tasks : nodePartSz * (mpi.myId+1);
+
+	if(mpi.isRoot()) printf("-- MPI nodes: %i, task size (total): %i\n", mpi.gridSize, n_tasks);
+	printf("-- My MPI id: %i, my task size: %i\n", mpi.myId, (end - begin));
+
 #pragma omp parallel for
-	for (size_t idx = 0; idx < n_tasks; ++idx) {
+	for (size_t idx = begin; idx < end; ++idx) {
 		size_t i, j;
 		idx2ij(idx, n_seq, i, j);
 		hamming(seq_len, 
 				seqss + i * seq_len, 
 				seqss + j * seq_len, 
 				poss_freq,
-				dis + idx,
-				mmf + idx,
-				strs + idx);
+				dis.data() + idx,
+				mmf.data() + idx,
+				strs.data() + idx);
 	}
+
+	if(!mpi.isRoot()) {
+		mpi.error(MPI_Send(dis.data() + begin, (end - begin)*sizeof(int), MPI_UINT8_T, mpi.root, 0, mpi.comm));
+		mpi.error(MPI_Send(mmf.data() + begin, (end - begin)*sizeof(double), MPI_UINT8_T, mpi.root, 0, mpi.comm));
+		for (size_t idx = begin; idx < end; ++idx) {
+			size_t str_sz = strs[idx].size();
+			mpi.error(MPI_Send(&str_sz, sizeof(size_t), MPI_UINT8_T, mpi.root, 0, mpi.comm));
+			if(str_sz == 0) continue;
+			mpi.error(MPI_Send(strs[idx].c_str(), str_sz, MPI_UINT8_T, mpi.root, 0, mpi.comm));
+		}
+	} else {
+		for(int nodeId = 1; nodeId < mpi.gridSize; ++nodeId) {
+			const size_t begin = nodePartSz * nodeId;
+			const size_t end = nodeId == mpi.gridSize-1? n_tasks : nodePartSz * (nodeId+1);
+			mpi.error(MPI_Recv(dis.data() + begin, (end - begin)*sizeof(int), MPI_UINT8_T, nodeId, 0, mpi.comm, MPI_STATUS_IGNORE));
+			mpi.error(MPI_Recv(mmf.data() + begin, (end - begin)*sizeof(double), MPI_UINT8_T, nodeId, 0, mpi.comm, MPI_STATUS_IGNORE));
+			for (size_t idx = begin; idx < end; ++idx) {
+				size_t str_sz;
+				mpi.error(MPI_Recv(&str_sz, sizeof(size_t), MPI_UINT8_T, nodeId, 0, mpi.comm, MPI_STATUS_IGNORE));
+				if(str_sz == 0) {
+					strs[idx].clear();
+					continue;
+				}
+				char str_rx_buff[str_sz+1];
+				mpi.error(MPI_Recv(str_rx_buff, str_sz, MPI_UINT8_T, nodeId, 0, mpi.comm, MPI_STATUS_IGNORE));
+				str_rx_buff[str_sz] = '\0';
+				strs[idx] = string(str_rx_buff);
+			}
+		}
+	}
+
+	return mpi.isRoot();
+}
+
+extern "C" {
+// Only Root node will return true
+bool compute_hamming_matrix(
+		size_t n_seq, size_t seq_len,
+		char* seqss, double* poss_freq, int* poss_ref,
+		const char* out_file, const char* net_file) {
+	g_posref = poss_ref;
+	size_t n_tasks = (n_seq - 1) * n_seq / 2;
+
+	vector<int> dis(n_tasks);
+	vector<double> mmf(n_tasks);
+	vector<string> strs(n_tasks);
+	if(!hamming_kernel(n_tasks, n_seq, seq_len, seqss, poss_freq, dis, mmf, strs)) return false;
+	
+	const auto cmp_idx = [&](const int& a, const int& b) -> bool {
+		if (dis[a] != dis[b]) {
+			return dis[a] < dis[b];
+		} else if (mmf[a] != mmf[b]) {
+			return mmf[a] < mmf[b];
+		} else {
+			// For total numerical equivalence to python's sort.
+			size_t ia, ja, ib, jb;
+			idx2ij(a, g_n_seq, ia, ja);
+			idx2ij(b, g_n_seq, ib, jb);
+			if (ia == ib) {
+				return ja < jb;
+			} else {
+				return ia < ib;
+			}
+		}
+	};
+
 	if (out_file) {
 		FILE* ouf = fopen(out_file, "w");
 		for (size_t idx = 0; idx < n_tasks; ++idx) {
@@ -201,8 +252,11 @@ void compute_hamming_matrix(
 			fprintf(ouf, "\n");
 		}
 		fclose(ouf);
+		delete[] idxs;
+		delete[] dsr;
 	}
-	delete dis;
-	delete mmf;
+
+	return true;
 }
+
 };

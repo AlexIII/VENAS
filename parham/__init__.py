@@ -24,6 +24,9 @@ def compute_hamming_matrix(seqss, pos_freq, pos_ref, out=None, net=None):
         out = out.encode('ascii')
     if net is not None:
         net = net.encode('ascii')
-    _lib.compute_hamming_matrix(n, m,
+    res = _lib.compute_hamming_matrix(n, m,
             seq_str.encode('ascii'), pos_freq_arr, pos_ref_arr,
             out, net)
+    
+    # Not root node, exiting
+    if res == 0: exit()

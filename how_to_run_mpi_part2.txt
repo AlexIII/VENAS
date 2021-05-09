@@ -1,0 +1,10 @@
+PY=../pypy3.7-v7.3.4-linux64/bin/pypy
+WORKLOAD_DIR=big_data
+N_NODES=4
+
+
+# For AWS
+# srun -N $N_NODES -n $N_NODES -c 24 --mpi=pmix time $PY -u haplotype_network.py $WORKLOAD_DIR
+
+# For local machine
+mpirun -n $N_NODES time $PY -u haplotype_network.py $WORKLOAD_DIR
